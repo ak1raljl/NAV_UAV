@@ -4,6 +4,10 @@ NAV_UAV is a reinforcement learning experiment project for UAV navigation based 
 
 The current setup focuses on training a multirotor to move forward, avoid obstacles, and reach a goal point in an AirSim scene.
 
+## Demo
+
+![AirSim Training Demo](airsim.gif)
+
 ## Features
 
 - AirSim multirotor environment wrapped as a Gym environment named `airsim_env`
