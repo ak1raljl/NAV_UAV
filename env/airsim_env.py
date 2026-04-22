@@ -17,7 +17,7 @@ class AirsimEnv(gym.Env):
         self.model = None
         self.data_path = None
         self.navigation_3d = True
-        self.using_velocity_state = False
+        self.using_velocity_state = True
         self.dt = 0.2
 
         self.start_position = [0, 0, 1]
@@ -26,11 +26,22 @@ class AirsimEnv(gym.Env):
         self.goal_distance = 75
         self.goal_random_angle = 0
         self.goals_dis = [70, 60, 50, 40, 30, 20, 10, 0]
+        self.gate_list = [
+            [5.81, -1.42, -0.33],
+            [17.72, 2.33, -0.33],
+            [27.8, -1.81, -2.36],
+            [38.42, 1.78, -1.41],
+            [50.85, -1.29, -1.14],
+            [63.38, 1.23, 0.72],
+            [71.45, -0.1, -0.22]
+        ]
+        self.use_gate_targets = len(self.gate_list) > 0
+        self.current_gate_index = 0
         self.level = 0
 
         self.work_space_x = [self.start_position[0] - 1, self.start_position[0] + 75]
         self.work_space_y = [self.start_position[1] - 3.5, self.start_position[1] + 3.5]
-        self.work_space_z = [0, 7]
+        self.work_space_z = [-1.2, 3]
         self.max_episode_steps = 300
         self._max_episode_steps = 300
 
@@ -49,7 +60,6 @@ class AirsimEnv(gym.Env):
         self.v_z = 0
         self.yaw = 0
         self.yaw_rate = 0
-        self.yaw_accumulated = 0.0  # 累计偏航角（弧度），用于超转检测
 
         self.v_xy_sp = 0
         self.v_z_sp = 0
@@ -57,6 +67,7 @@ class AirsimEnv(gym.Env):
 
         self.crash_distance = 0.1
         self.accept_radius = 1
+        self.subgoal_bonus = 200.0
         self.max_depth_meters = 8
         self.screen_height = 60
         self.screen_width = 90
@@ -70,18 +81,16 @@ class AirsimEnv(gym.Env):
         self.max_vertical_difference = 5
 
         if self.navigation_3d:
-            if self.using_velocity_state:
-                self.state_feature_length = 6
-            else:
-                self.state_feature_length = 3
+            base_state_feature_length = 6
+            velocity_state_feature_length = 3 if self.using_velocity_state else 0
+            self.state_feature_length = base_state_feature_length + velocity_state_feature_length
             self.action_space = spaces.Box(low=np.array([self.v_xy_min, -self.v_z_max, -self.yaw_rate_max_rad]),
                                            high=np.array([self.v_xy_max, self.v_z_max, self.yaw_rate_max_rad]),
                                            dtype=np.float32)
         else:
-            if self.using_velocity_state:
-                self.state_feature_length = 4
-            else:
-                self.state_feature_length = 2
+            base_state_feature_length = 5
+            velocity_state_feature_length = 2 if self.using_velocity_state else 0
+            self.state_feature_length = base_state_feature_length + velocity_state_feature_length
             self.action_space = spaces.Box(low=np.array([self.v_xy_min, -self.yaw_rate_max_rad]),
                                            high=np.array([self.v_xy_max, self.yaw_rate_max_rad]),
                                            dtype=np.float32)
@@ -105,6 +114,8 @@ class AirsimEnv(gym.Env):
 
     def reset(self):
         self.client.reset()
+        self.current_gate_index = 0
+        self.level = 0
         self.update_goal_pose()
         yaw_noise = self.start_random_angle * np.random.random()
         pose = self.client.simGetVehiclePose()
@@ -125,30 +136,31 @@ class AirsimEnv(gym.Env):
         self.episode_num += 1
         self.step_num = 0
         self.cumulated_episode_reward = 0
-        self.goal_distance = self.get_distance()
-        self.previous_distance_from_des_point = self.goal_distance
-        self.level = 0
-        self.yaw_accumulated = 0.0
+        self._reset_goal_tracking()
 
         obs = self.get_obs()
 
         return obs
 
     def step(self, action):
+        self.set_action(action)
+        gate_reward = 0.0
+        has_reached_des_pose = False
+        passed_gate = False
+        if self.is_in_desired_pose():
+            gate_reward, has_reached_des_pose, passed_gate = self._advance_goal()
+
         distance = self.get_distance()
         position_ue4 = self.get_position()
-        self.set_action(action)
         obs = self.get_obs()
 
         is_not_inside_workspace_now = self.is_not_inside_workspace()
-        has_reached_des_pose = self.is_in_desired_pose()
         too_close_to_obstable = self.is_crashed()
 
         is_timeout = self.step_num >= self.max_episode_steps
-        is_over_rotated = abs(self.yaw_accumulated) > (math.pi / 2.0)
         done = (is_not_inside_workspace_now or has_reached_des_pose
-                or too_close_to_obstable or is_timeout or is_over_rotated)
-        reward = self.compute_reward_final(done, action)
+                or too_close_to_obstable or is_timeout)
+        reward = self.compute_reward_final(done, action) + gate_reward
         if is_not_inside_workspace_now:
             reward = -500
         if has_reached_des_pose:
@@ -157,15 +169,14 @@ class AirsimEnv(gym.Env):
             reward = -500
         if is_timeout:
             reward = -500
-        if is_over_rotated:
-            reward = -500
         self.cumulated_episode_reward += reward
         info = {
             'is_success': has_reached_des_pose,
             'is_crash': too_close_to_obstable,
             'is_not_in_workspace': is_not_inside_workspace_now,
             'is_timeout': is_timeout,
-            'is_over_rotated': is_over_rotated,
+            'passed_gate': passed_gate,
+            'current_gate_index': self.current_gate_index,
             'step_num': self.step_num,
             'reward': self.cumulated_episode_reward,
             'level': self.level
@@ -199,12 +210,8 @@ class AirsimEnv(gym.Env):
             self.v_z_sp = float(action[1])
         else:
             self.v_z_sp = 0
-        prev_yaw = self.yaw
         self.yaw = self.get_attitude()[2]
-        delta_yaw = self.yaw - prev_yaw
         # wrap delta to [-π, π] 避免跨越 ±180° 时跳变
-        delta_yaw = (delta_yaw + math.pi) % (2 * math.pi) - math.pi
-        self.yaw_accumulated += delta_yaw
         yaw_sp = self.yaw + self.yaw_rate_sp * self.dt
 
         if yaw_sp > math.radians(180):
@@ -238,6 +245,13 @@ class AirsimEnv(gym.Env):
         self.client.simPause(True)
 
     def update_goal_pose(self):
+        if self.use_gate_targets:
+            gate_position = self._get_active_gate_position()
+            self.goal_position[0] = gate_position[0]
+            self.goal_position[1] = gate_position[1]
+            self.goal_position[2] = gate_position[2]
+            return
+
         distance = self.goal_distance
         self.goal_position[0] = distance + self.start_position[0]
         self.goal_position[1] = self.start_position[1]
@@ -248,7 +262,14 @@ class AirsimEnv(gym.Env):
         return [position.x_val, position.y_val, -position.z_val]
 
     def get_distance(self):
-        return self.goal_distance - self.get_position()[0]
+        current_position = self.get_position()
+        if self.use_gate_targets:
+            return math.sqrt(
+                (self.goal_position[0] - current_position[0]) ** 2 +
+                (self.goal_position[1] - current_position[1]) ** 2 +
+                (self.goal_position[2] - current_position[2]) ** 2
+            )
+        return self.goal_distance - current_position[0]
 
     def get_attitude(self):
         self.state_current_attitude = self.client.simGetVehiclePose().orientation
@@ -300,29 +321,79 @@ class AirsimEnv(gym.Env):
 
     def _get_state_feature(self):
         distance = self.get_distance()
+        current_position = self.get_position()
         relative_yaw = self._get_relative_yaw()
-        relative_pose_z = self.get_position()[2] - self.goal_position[2]
+        relative_pose_y = current_position[1] - self.goal_position[1]
+        relative_pose_z = current_position[2] - self.goal_position[2]
 
         # normalize to [-1, 1]
-        distance_norm     = np.clip(distance / self.goal_distance * 2 - 1, -1, 1)
-        vertical_norm     = np.clip(relative_pose_z / self.max_vertical_difference, -1, 1)
+        distance_scale = max(self.goal_distance, 1e-6)
+        lateral_scale = max(
+            abs(self.work_space_y[0] - self.goal_position[1]),
+            abs(self.work_space_y[1] - self.goal_position[1]),
+            1e-6
+        )
+        distance_norm = np.clip(distance / distance_scale * 2 - 1, -1, 1)
+        lateral_norm = np.clip(relative_pose_y / lateral_scale, -1, 1)
+        vertical_norm = np.clip(relative_pose_z / self.max_vertical_difference, -1, 1)
         relative_yaw_norm = np.clip(relative_yaw / math.pi, -1, 1)
+        time_progress = self.step_num / max(self.max_episode_steps, 1)
+        time_remaining_norm = np.clip(1.0 - 2.0 * time_progress, -1, 1)
+        progress_total = max(self._get_progress_total(), 1)
+        level_norm = np.clip(2.0 * self.level / progress_total - 1.0, -1, 1)
 
         velocity = self.get_velocity()
         linear_velocity_xy, linear_velocity_z, yaw_rate = velocity
-        velocity_xy_norm  = np.clip((linear_velocity_xy - self.v_xy_min) / (self.v_xy_max - self.v_xy_min) * 2 - 1, -1, 1)
-        velocity_z_norm   = np.clip(linear_velocity_z / self.v_z_max, -1, 1)
-        yaw_rate_norm     = np.clip(yaw_rate / self.yaw_rate_max_rad, -1, 1)
+        velocity_xy_norm = np.clip(
+            (linear_velocity_xy - self.v_xy_min) / (self.v_xy_max - self.v_xy_min) * 2 - 1,
+            -1,
+            1
+        )
+        velocity_z_norm = np.clip(linear_velocity_z / self.v_z_max, -1, 1)
+        yaw_rate_norm = np.clip(yaw_rate / self.yaw_rate_max_rad, -1, 1)
 
-        self.state_raw = np.array([distance, relative_pose_z, math.degrees(relative_yaw),
-                                   linear_velocity_xy, linear_velocity_z, math.degrees(yaw_rate)])
-        state_full = np.array([distance_norm, vertical_norm, relative_yaw_norm,
-                               velocity_xy_norm, velocity_z_norm, yaw_rate_norm], dtype=np.float32)
+        self.state_raw = np.array([
+            distance,
+            relative_pose_z,
+            math.degrees(relative_yaw),
+            linear_velocity_xy,
+            linear_velocity_z,
+            math.degrees(yaw_rate),
+            relative_pose_y,
+            time_progress,
+            self.level
+        ], dtype=np.float32)
 
         if self.navigation_3d:
-            state = state_full[:6] if self.using_velocity_state else state_full[:3]
+            base_state = np.array([
+                distance_norm,
+                lateral_norm,
+                vertical_norm,
+                relative_yaw_norm,
+                time_remaining_norm,
+                level_norm
+            ], dtype=np.float32)
+            dynamic_state = np.array([
+                velocity_xy_norm,
+                velocity_z_norm,
+                yaw_rate_norm
+            ], dtype=np.float32)
         else:
-            state = state_full[[0, 2, 3, 5]] if self.using_velocity_state else state_full[[0, 2]]
+            base_state = np.array([
+                distance_norm,
+                lateral_norm,
+                relative_yaw_norm,
+                time_remaining_norm,
+                level_norm
+            ], dtype=np.float32)
+            dynamic_state = np.array([
+                velocity_xy_norm,
+                yaw_rate_norm
+            ], dtype=np.float32)
+
+        state = base_state
+        if self.using_velocity_state:
+            state = np.concatenate((base_state, dynamic_state)).astype(np.float32)
 
         return state
 
@@ -399,16 +470,13 @@ class AirsimEnv(gym.Env):
         # 偏航角速率（抑制原地打转）
         r_yaw_rate = -0.3 * abs(action[-1]) / self.yaw_rate_max_rad
 
-        # 累计偏转惩罚（越接近 ±180° 惩罚越大）
-        r_spin = -0.5 * np.clip(abs(self.yaw_accumulated) / math.pi / 2.0, 0, 1)
-
         r_vz = 0.0
         r_z_err = 0.0
         if self.navigation_3d:
             r_vz   = -0.1 * (abs(action[1]) / self.v_z_max) ** 2
             r_z_err = -0.2 * (abs(self.state_raw[1]) / self.max_vertical_difference) ** 2
 
-        return r_yaw_align + r_yaw_rate + r_spin + r_vz + r_z_err
+        return r_yaw_align + r_yaw_rate  + r_vz + r_z_err
 
     def _safety_reward(self):
         """安全奖励：障碍物距离惩罚"""
@@ -422,7 +490,7 @@ class AirsimEnv(gym.Env):
     def compute_reward_final(self, done, action):
         if done:
             return 0
-        r_process = self._process_reward()
+        r_process = self._compute_progress_reward()
         r_safety  = self._safety_reward()
         r_reg     = self._regularization_reward(action)
         return r_process + r_safety + r_reg
@@ -434,7 +502,58 @@ class AirsimEnv(gym.Env):
         self.client.simPrintLogMessage('reward: ', "{:4.4f} total: {:4.4f}".format(
             reward, self.cumulated_episode_reward))
         self.client.simPrintLogMessage('Min_depth: ', str(self.min_distance_to_obstacles))
-        # self.client.simPrintLogMessage('position: ', str(pose))
+        self.client.simPrintLogMessage('position: ', str(pose))
         self.client.simPrintLogMessage('distance: ', str(distance))
         self.client.simPrintLogMessage('level: ', str(self.level))
+        self.client.simPrintLogMessage('gate: ', str(self.current_gate_index))
+
+    def _compute_progress_reward(self):
+        distance_now = self.get_distance()
+        distance_delta = self.previous_distance_from_des_point - distance_now
+        self.previous_distance_from_des_point = distance_now
+        r_distance = 300.0 * distance_delta / max(self.goal_distance, self.accept_radius)
+
+        if self.use_gate_targets:
+            return r_distance
+
+        r_milestone = 0.0
+        dis_remaining = self.get_position()[0]
+        dis_remaining = self.goal_distance - dis_remaining
+        if self.level < len(self.goals_dis) and dis_remaining < self.goals_dis[self.level]:
+            self.level += 1
+            r_milestone = 1.2 * (1 + self.level / len(self.goals_dis))
+
+        return r_distance + r_milestone
+
+    def _get_active_gate_position(self):
+        if not self.gate_list:
+            return [self.goal_distance + self.start_position[0], self.start_position[1], self.start_position[2]]
+
+        gate_index = min(self.current_gate_index, len(self.gate_list) - 1)
+        gate_position = self.gate_list[gate_index]
+        return [float(gate_position[0]), float(gate_position[1]), float(-gate_position[2])]
+
+    def _get_progress_total(self):
+        if self.use_gate_targets:
+            return len(self.gate_list)
+        return len(self.goals_dis)
+
+    def _reset_goal_tracking(self):
+        self.goal_distance = max(self.get_distance(), self.accept_radius)
+        self.previous_distance_from_des_point = self.goal_distance
+
+    def _advance_goal(self):
+        passed_gate = False
+        if self.use_gate_targets:
+            passed_gate = True
+            self.level = min(self.level + 1, len(self.gate_list))
+            if self.current_gate_index >= len(self.gate_list) - 1:
+                return 0.0, True, passed_gate
+
+            self.current_gate_index += 1
+            self.update_goal_pose()
+            self._reset_goal_tracking()
+            return self.subgoal_bonus, False, passed_gate
+
+        return 0.0, True, passed_gate
 
