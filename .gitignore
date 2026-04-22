@@ -1,0 +1,7 @@
+__pycache__
+.vscode
+.idea
+log_path
+logs
+.claude
+CLAUDE.md

@@ -1,0 +1,4 @@
+algo: PPO
+total_timesteps: 100000
+tb_log_name: PPO_0422
+env_name: airsim_env
